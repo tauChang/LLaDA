@@ -16,8 +16,11 @@ from lm_eval.api.registry import register_model
 from tqdm import tqdm
 
 from transformers import AutoTokenizer, AutoModel
-from generate import generate
+from generate import generate, generate_batch
+from more_itertools import chunked
+import time
 
+stats = {"throughput": [], "peak_mem": []}
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -75,20 +78,25 @@ class LLaDAEvalHarness(LM):
         if self.accelerator is not None:
             model_kwargs.update({'device_map': {'': f'{self.accelerator.device}'}})
 
-        self.model = AutoModel.from_pretrained(model_path, trust_remote_code=True, torch_dtype=torch.bfloat16, **model_kwargs)
+        self.model = AutoModel.from_pretrained(model_path, cache_dir="/work/10446/tchang85/ls6/tmp/",trust_remote_code=True, torch_dtype=torch.bfloat16, **model_kwargs)
         self.model.eval()
+        # print(f"after loading model, max memory: {torch.cuda.max_memory_allocated() / 1024 / 1024/ 1024}")
 
         self.device = torch.device(device)
         if self.accelerator is not None:
-            self.model = self.accelerator.prepare(self.model)
+        #     self.model = self.accelerator.prepare(self.model)
+            self.model = self.accelerator.prepare_model(self.model, evaluation_mode=True)
             self.device = torch.device(f'{self.accelerator.device}')
             self._rank = self.accelerator.local_process_index
             self._world_size = self.accelerator.num_processes
         else: 
             self.model = self.model.to(device)
+        # self.model = self.model.to(self.device)
+        # print(f"before loading tokenizer, max memory: {torch.cuda.max_memory_allocated() / 1024 / 1024/ 1024}")
 
         self.mask_id = mask_id
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, cache_dir="/work/10446/tchang85/ls6/tmp/", trust_remote_code=True)
+        # print(f"after loading tokenizer, max memory: {torch.cuda.max_memory_allocated() / 1024 / 1024/ 1024}")
 
         self.mc_num = mc_num
         self.batch_size = int(batch_size)
@@ -166,6 +174,7 @@ class LLaDAEvalHarness(LM):
             loss = F.cross_entropy(logits[mask_indices], seq[mask_indices], reduction='none') / p_mask[mask_indices]
             loss = loss.sum() / self.batch_size
             loss_acc.append(loss.item())
+            print(F"HELO")
 
         return - sum(loss_acc) / len(loss_acc)
 
@@ -243,7 +252,7 @@ class LLaDAEvalHarness(LM):
     def loglikelihood_rolling(self, requests):
         raise NotImplementedError
 
-    def generate_until(self, requests: list[Instance]):
+    def generate_until_old(self, requests: list[Instance]):
         def _tokenize(e):
             return {
                 "question": self.tokenizer(e["question"])["input_ids"],
@@ -278,8 +287,77 @@ class LLaDAEvalHarness(LM):
 
         return out
 
+    def generate_until(self, requests: list[Instance]):
+        def _tokenize(e):
+            return {
+                # "question": self.tokenizer(e["question"])["input_ids"],
+                "question_text": e["question"],
+                "until": e["until"],
+            }
+
+        ds = [{"question": req.args[0], "until": req.args[1]['until']} for req in requests]
+        ds = Dataset.from_list(ds)
+        ds = ds.map(_tokenize)
+        ds = ds.with_format("torch")
+
+        out = []
+        # print(f"max memory before tqdm even: {torch.cuda.max_memory_allocated(self.device) / 1024 / 1024/ 1024}")
+        for elem in tqdm(chunked(ds, self.batch_size), desc="Generating..."):
+            # print(f"elem: {elem}")
+            prompts = [e["question_text"] for e in elem]
+            input_ids = self.tokenizer(
+                prompts, 
+                padding=True, 
+                padding_side="right",
+                return_tensors="pt")["input_ids"]
+            input_ids = input_ids.to(self.device)
+            # prompt = elem["question"].unsqueeze(0).to(self.device)
+            stop_tokens = [e['until'] for e in elem]
+            
+            # shape of input_ids: (batch_size, seq_len)
+            start_time = time.time()
+            torch.cuda.reset_peak_memory_stats(self.device)
+            generated_answer = generate_batch(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, 
+                                        temperature=0, cfg_scale=self.cfg, remasking=self.remasking, mask_id=self.mask_id)
+            end_time = time.time()
+            peak_memory = torch.cuda.max_memory_allocated(self.device) / 1024 / 1024/ 1024
+            
+            num_generated_tokens = generated_answer.shape[1] - input_ids.shape[1]
+            batch_size = generated_answer.shape[0]
+            total_generated_tokens = num_generated_tokens * batch_size
+            time_taken = end_time - start_time
+            throughput = total_generated_tokens / time_taken
+            
+            stats["throughput"].append(throughput)
+            stats["peak_mem"].append(peak_memory)
+            
+            # generated_answer = self.tokenizer.decode(generated_answer[0][prompt.shape[1]:], skip_special_tokens=False)
+            generated_answers = self.tokenizer.batch_decode(generated_answer[:, input_ids.shape[1]:], skip_special_tokens=False)
+            # for stop_seq in stop_tokens:
+            #     if stop_seq in generated_answer:
+            #         generated_answer = generated_answer.split(stop_seq)[0]
+            for i, generated_answer in enumerate(generated_answers):
+                for stop_seq in elem[i]['until']:
+                    if stop_seq in generated_answer:
+                        generated_answer = generated_answer.split(stop_seq)[0]
+                generated_answer_ids = self.tokenizer(generated_answer)["input_ids"]
+                generated_answer = self.tokenizer.decode(generated_answer_ids, skip_special_tokens=True)
+                out.append(generated_answer)
+                # print(f"generated_answer {i}: {generated_answer}")
+
+            # # remove special tokens
+            # generated_answer_ids = self.tokenizer(generated_answer)["input_ids"]
+            # generated_answer = self.tokenizer.decode(generated_answer_ids, skip_special_tokens=True)
+            # out.append(generated_answer)
+
+            if self.accelerator is not None:
+                self.accelerator.wait_for_everyone()
+
+        return out
 
 if __name__ == "__main__":
     set_seed(1234)
     cli_evaluate()
-    
+    print(f"stats: {stats}")
+    print(f"average throughput: {np.mean(stats['throughput'])}")
+    print(f"average peak memory: {np.mean(stats['peak_mem'])}")
