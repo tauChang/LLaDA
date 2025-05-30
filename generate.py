@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import torch.nn.functional as F
+import os
 
 from transformers import AutoTokenizer, AutoModel
 
@@ -152,6 +153,128 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
 
     return x
 
+num_called = 0
+import json
+@ torch.no_grad()
+def generate_batch_record(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
+             cfg_scale=0., remasking='low_confidence', mask_id=126336):
+    '''
+    Args:
+        model: Mask predictor.
+        prompt: A tensor of shape (B, L). L being the max length of all prompts. Assume left padded.
+        steps: Sampling steps, less than or equal to gen_length.
+        gen_length: Generated answer length.
+        block_length: Block length, less than or equal to gen_length. If less than gen_length, it means using semi_autoregressive remasking.
+        temperature: Categorical distribution sampling temperature.
+        cfg_scale: Unsupervised classifier-free guidance scale.
+        remasking: Remasking strategy. 'low_confidence' or 'random'.
+        mask_id: The toke id of [MASK] is 126336.
+    '''
+    global num_called
+    # file_name = "record.json"
+    # file name is time
+    cosine_schedule = False
+    import time
+        
+    # print(f"max memory allocated before anything: {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024} GB")
+    B, L = prompt.shape
+    x = torch.full((B, L + gen_length), mask_id, dtype=torch.long).to(model.device)
+    x[:, :L] = prompt.clone()
+    # x = torch.full((1, prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
+    # x[:, :prompt.shape[1]] = prompt.clone()
+
+    prompt_index = (x != mask_id)
+
+    assert gen_length % block_length == 0
+    num_blocks = gen_length // block_length
+
+    assert steps % num_blocks == 0
+    steps = steps // num_blocks
+
+    for num_block in range(num_blocks):
+        block_mask_index = (x[:, L + num_block * block_length: L + (num_block + 1) * block_length:] == mask_id)
+        # num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
+        if cosine_schedule:
+            num_transfer_tokens = get_num_transfer_tokens_cosine(block_mask_index, steps)
+        else:
+            num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
+            
+        print(f"num_transfer_tokens: {num_transfer_tokens}")
+        for i in range(steps):
+            # print(f"step {i} / {steps} block {num_block} / {num_blocks}")
+            mask_index = (x == mask_id)
+            # print(f"max memory allocated before model(x): {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024} GB")
+            if cfg_scale > 0.:
+                un_x = x.clone()
+                un_x[prompt_index] = mask_id
+                x_ = torch.cat([x, un_x], dim=0)
+                logits = model(x_).logits
+                logits, un_logits = torch.chunk(logits, 2, dim=0)
+                logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+            else:
+                logits = model(x).logits
+
+            # save the logits to a file
+            for batch_id in range(logits.shape[0]):
+                file_name = f"record/{'cosine' if cosine_schedule else 'linear'}/logits/batch_{num_called+batch_id}/step_{i}.npy"
+                # mkdir if not exist
+                os.makedirs(os.path.dirname(file_name), exist_ok=True)
+                np.save(file_name, logits[batch_id].to(torch.float16).cpu().numpy())
+
+            # print(f"max memory allocated after model(x): {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024} GB")
+            logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+            x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
+
+            if remasking == 'low_confidence':
+                p = F.softmax(logits.to(torch.float64), dim=-1)
+                x0_p = torch.squeeze(
+                    torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # b, l
+            elif remasking == 'random':
+                x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
+            else:
+                raise NotImplementedError(remasking)
+
+            x0_p[:, prompt.shape[1] + (num_block + 1) * block_length:] = -np.inf
+
+            x0 = torch.where(mask_index, x0, x)
+            confidence = torch.where(mask_index, x0_p, -np.inf)
+
+            transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
+            for j in range(confidence.shape[0]):
+                _, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j, i])
+                transfer_index[j, select_index] = True
+
+                # for recording ------------
+                denoise_record = []
+
+                for k in range(len(select_index)):
+                    step_id = i
+                    token_id = select_index[k]
+                    vocab_id = x0[batch_id, token_id].cpu() # single element
+                    token_id -= L
+                    denoise_record.append((step_id, token_id, vocab_id))
+                
+                # save to file
+                file_name = f"record/{'cosine' if cosine_schedule else 'linear'}/denoise_schedules/batch_{num_called+j}.csv"
+                os.makedirs(os.path.dirname(file_name), exist_ok=True)
+                # if the file does not exist, add header
+                if not os.path.exists(file_name):
+                    with open(file_name, 'w') as f:
+                        f.write("step_id,token_id,vocab_id\n")
+                        for record in denoise_record:
+                            f.write(f"{record[0]},{record[1]},{record[2]}\n")
+                else:
+                    with open(file_name, 'a') as f:
+                        for record in denoise_record:
+                            f.write(f"{record[0]},{record[1]},{record[2]}\n")
+                        
+
+            x[transfer_index] = x0[transfer_index]
+    
+    # write to file
+    num_called += 1
+    
+    return x
 
 @ torch.no_grad()
 def generate_batch(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
@@ -227,20 +350,124 @@ def generate_batch(model, prompt, steps=128, gen_length=128, block_length=128, t
             x[transfer_index] = x0[transfer_index]
     return x
 
+@ torch.no_grad()
+def generate_batch_confidence(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
+             cfg_scale=0., remasking='low_confidence', mask_id=126336):
+    '''
+    Args:
+        model: Mask predictor.
+        prompt: A tensor of shape (B, L). L being the max length of all prompts. Assume left padded.
+        steps: Sampling steps, less than or equal to gen_length.
+        gen_length: Generated answer length.
+        block_length: Block length, less than or equal to gen_length. If less than gen_length, it means using semi_autoregressive remasking.
+        temperature: Categorical distribution sampling temperature.
+        cfg_scale: Unsupervised classifier-free guidance scale.
+        remasking: Remasking strategy. 'low_confidence' or 'random'.
+        mask_id: The toke id of [MASK] is 126336.
+    '''
+    # print(f"max memory allocated before anything: {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024} GB")
+    B, L = prompt.shape
+    x = torch.full((B, L + gen_length), mask_id, dtype=torch.long).to(model.device)
+    x[:, :L] = prompt.clone()
+    # x = torch.full((1, prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
+    # x[:, :prompt.shape[1]] = prompt.clone()
+
+    prompt_index = (x != mask_id)
+
+    assert gen_length % block_length == 0
+    num_blocks = gen_length // block_length
+
+    assert steps % num_blocks == 0
+    steps = steps // num_blocks
+
+    for num_block in range(num_blocks):
+        block_mask_index = (x[:, L + num_block * block_length: L + (num_block + 1) * block_length:] == mask_id)
+        # num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
+        # num_transfer_tokens = get_num_transfer_tokens_cosine(block_mask_index, steps)
+
+        # shape: batch size
+        tokens_transferred = torch.zeros(B, dtype=torch.int64, device=x.device)
+        # print(f"num_transfer_tokens: {num_transfer_tokens}")
+        for i in range(steps):
+            if tokens_transferred == block_length:
+                print(f"finishing at step {i} / {steps} block {num_block} / {num_blocks}, all tokens transferred.")
+                break
+            # print(f"step {i} / {steps} block {num_block} / {num_blocks}")
+            mask_index = (x == mask_id)
+            # print(f"max memory allocated before model(x): {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024} GB")
+            if cfg_scale > 0.:
+                un_x = x.clone()
+                un_x[prompt_index] = mask_id
+                x_ = torch.cat([x, un_x], dim=0)
+                logits = model(x_).logits
+                logits, un_logits = torch.chunk(logits, 2, dim=0)
+                logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+            else:
+                logits = model(x).logits
+
+            # print(f"max memory allocated after model(x): {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024} GB")
+            logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+            x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
+
+            p = F.softmax(logits.to(torch.float64), dim=-1)
+            x0_p = torch.squeeze(
+                torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # b, l
+
+            x0_p[:, prompt.shape[1] + (num_block + 1) * block_length:] = -np.inf
+
+            x0 = torch.where(mask_index, x0, x)
+            confidence = torch.where(mask_index, x0_p, -np.inf)
+
+            transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
+            for j in range(confidence.shape[0]):
+                # _, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j, i])
+                # select all indices with confidence greater than 0.8
+                select_index = (confidence[j] > 0.9).nonzero(as_tuple=True)[0]
+                # print(f"select index shape: {select_index.shape}")
+                # print(f"select_index: {select_index}")
+                # if not enough tokens are selected, also select the top (k - len(select_index)) tokens
+                # required = num_transfer_tokens[j, i]
+                required = block_length // steps
+                if len(select_index) < required:
+                    # Find indices not in select_index
+                    remaining_indices = torch.zeros_like(confidence[j], dtype=torch.bool)
+                    # mark masked indices as true
+                    remaining_indices[mask_index[j]] = True
+                    remaining_indices[select_index] = False
+                    # print(f"remaining indices: {remaining_indices}")
+                    
+                    remaining_confidences = confidence[j][remaining_indices]
+                    remaining_indices_all = remaining_indices.nonzero(as_tuple=True)[0]
+
+                    # Top-k from the remaining
+                    k_additional = required - len(select_index)
+                    if k_additional > 0 and len(remaining_confidences) > 0:
+                        k_additional = min(k_additional, len(remaining_confidences))
+                        topk_vals, topk_idx = torch.topk(remaining_confidences, k=k_additional)
+                        additional_indices = remaining_indices_all[topk_idx]
+                        # Combine both sets of indices
+                        select_index = torch.cat([select_index, additional_indices])
+                
+                tokens_transferred[j] += len(select_index)
+                print(f"step {i}, block {num_block}, batch {j}, num tokens transferred: {len(select_index)}, total transferred: {tokens_transferred[j]}")
+                transfer_index[j, select_index] = True
+            x[transfer_index] = x0[transfer_index]
+    return x
+
 def main():
     device = 'cuda'
     model = AutoModel.from_pretrained('GSAI-ML/LLaDA-8B-Base', cache_dir="/work/10446/tchang85/ls6/tmp/", trust_remote_code=True, torch_dtype=torch.bfloat16).to(device).eval()
     tokenizer = AutoTokenizer.from_pretrained('GSAI-ML/LLaDA-8B-Base', cache_dir="/work/10446/tchang85/ls6/tmp/", trust_remote_code=True)
 
     prompt = [
-        "Lily can run 20000 kilometers per hour. How many kilometers can she run in 8 hours? Explain your answer.",
-        "Lily Colins can run 12 kilometers per hour for 4 hours. After that, she runs 3 km per hour. How many kilometers can she run in 5 hours? Explain your answer.",
+        # "Lily can run 20000 kilometers per hour. How many kilometers can she run in 8 hours? Explain your answer.",
+        "Lily can run 12 kilometers per hour for 4 hours. After that, she runs 6 kilometers per hour. How many kilometers can she run in 8 hours? Explain your answer.",
     ]
 
     input_ids = tokenizer(prompt, padding=True, padding_side='left', return_tensors='pt')['input_ids']
     print(f"input_ids: {input_ids}")
     
-    out = generate_batch(model, input_ids, steps=128, gen_length=128, block_length=128, temperature=0., cfg_scale=0., remasking='low_confidence')
+    out = generate_batch_confidence(model, input_ids, steps=128, gen_length=128, block_length=128, temperature=0., cfg_scale=0., remasking='low_confidence')
     print(tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True))
     
     
@@ -279,4 +506,5 @@ def main_old():
 
 
 if __name__ == '__main__':
-    main_old()
+    # main_old()
+    main()

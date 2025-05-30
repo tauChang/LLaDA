@@ -16,7 +16,7 @@ from lm_eval.api.registry import register_model
 from tqdm import tqdm
 
 from transformers import AutoTokenizer, AutoModel
-from generate import generate, generate_batch
+from generate import generate, generate_batch, generate_batch_record, generate_batch_confidence
 from more_itertools import chunked
 import time
 
@@ -317,8 +317,10 @@ class LLaDAEvalHarness(LM):
             # shape of input_ids: (batch_size, seq_len)
             start_time = time.time()
             torch.cuda.reset_peak_memory_stats(self.device)
-            generated_answer = generate_batch(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, 
+            generated_answer = generate_batch_confidence(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, 
                                         temperature=0, cfg_scale=self.cfg, remasking=self.remasking, mask_id=self.mask_id)
+            # generated_answer = generate_batch(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, 
+            #                             temperature=0, cfg_scale=self.cfg, remasking=self.remasking, mask_id=self.mask_id)
             end_time = time.time()
             peak_memory = torch.cuda.max_memory_allocated(self.device) / 1024 / 1024/ 1024
             
